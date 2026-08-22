@@ -2,6 +2,7 @@ package resolve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,10 +22,15 @@ type countingHasher struct {
 	count atomic.Int64
 	// returned for every call; defaults to "sha256-"+dir
 	hash string
+	// when set, returned instead of a hash on every call
+	err error
 }
 
 func (h *countingHasher) Hash(dir string) (string, error) {
 	h.count.Add(1)
+	if h.err != nil {
+		return "", h.err
+	}
 	if h.hash != "" {
 		return h.hash, nil
 	}
@@ -346,14 +352,29 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 	}
 
 	tests := []struct {
-		name               string
-		modules            []modulestxt.Module // nil → derived from downloads with no replacements
-		downloads          []ModuleDownload
-		existingMods       map[string]mod.ModuleConfig
-		wantHashCalls      int64
-		wantHash           string
-		wantGoVersion      string
-		wantGoVersionEmpty bool
+		name                string
+		modules             []modulestxt.Module // nil → derived from downloads with no replacements
+		downloads           []ModuleDownload
+		existingMods        map[string]mod.ModuleConfig
+		replacements        map[string]mod.Replacement
+		wantHashCalls       int64
+		wantHash            string
+		wantVersion         string
+		wantRequiredVersion string
+		wantGoVersion       string
+		wantVersioned       bool
+		wantUnused          bool
+		wantImplicit        bool
+		wantReplacedPath    string
+		wantPackages        []string
+		hasherErr           error
+		wantErr             string
+		// For cases resolving two modules — asserted unconditionally against
+		// deps[1] whenever there are two, so a wrong second entry can't hide
+		// behind an unset expectation the way an omitted deps[0] field used to.
+		wantVersion2   string
+		wantHash2      string
+		wantGoVersion2 string
 	}{
 		{
 			name:          "ReusesHashWhenVersionMatches",
@@ -361,6 +382,7 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			existingMods:  map[string]mod.ModuleConfig{"example.com/foo": fooExisting},
 			wantHashCalls: 0,
 			wantHash:      "sha256-cached-foo",
+			wantVersion:   "v1.2.3",
 			wantGoVersion: "1.22",
 		},
 		{
@@ -369,6 +391,7 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			existingMods:  map[string]mod.ModuleConfig{"example.com/foo": {Path: "example.com/foo", Version: "v1.0.0", Hash: "sha256-old"}},
 			wantHashCalls: 1,
 			wantHash:      "sha256-fresh",
+			wantVersion:   "v1.2.3",
 		},
 		{
 			name:          "HashesNewModuleNotInExisting",
@@ -376,20 +399,30 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			existingMods:  map[string]mod.ModuleConfig{"example.com/foo": fooExisting},
 			wantHashCalls: 1,
 			wantHash:      "sha256-fresh",
+			wantVersion:   "v2.0.0",
 		},
 		{
-			name:          "HashesAllWhenExistingModsIsNil",
-			downloads:     []ModuleDownload{fooDownload, barDownload},
-			existingMods:  nil,
-			wantHashCalls: 2,
+			name:           "HashesAllWhenExistingModsIsNil",
+			downloads:      []ModuleDownload{fooDownload, barDownload},
+			existingMods:   nil,
+			wantHashCalls:  2,
+			wantHash:       "sha256-fresh",
+			wantVersion:    "v1.2.3",
+			wantVersion2:   "v2.0.0",
+			wantHash2:      "sha256-fresh",
+			wantGoVersion2: "",
 		},
 		{
-			name:          "ReusesBothWhenAllMatch",
-			downloads:     []ModuleDownload{fooDownload, barDownload},
-			existingMods:  map[string]mod.ModuleConfig{"example.com/foo": fooExisting, "example.com/bar": barExisting},
-			wantHashCalls: 0,
-			wantHash:      "sha256-cached-foo",
-			wantGoVersion: "1.22",
+			name:           "ReusesBothWhenAllMatch",
+			downloads:      []ModuleDownload{fooDownload, barDownload},
+			existingMods:   map[string]mod.ModuleConfig{"example.com/foo": fooExisting, "example.com/bar": barExisting},
+			wantHashCalls:  0,
+			wantHash:       "sha256-cached-foo",
+			wantVersion:    "v1.2.3",
+			wantGoVersion:  "1.22",
+			wantVersion2:   "v2.0.0",
+			wantHash2:      "sha256-cached-bar",
+			wantGoVersion2: "1.23",
 		},
 		{
 			name:      "HashesWhenCachedHashIsEmpty",
@@ -399,6 +432,7 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			}},
 			wantHashCalls: 1,
 			wantHash:      "sha256-fresh",
+			wantVersion:   "v1.2.3",
 		},
 		{
 			name:      "NeverReusesLocalEntryEvenIfVersionMatches",
@@ -408,6 +442,116 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			}},
 			wantHashCalls: 1,
 			wantHash:      "sha256-fresh",
+			wantVersion:   "v1.2.3",
+		},
+		{
+			// go.mod named a version on the left of "=>" (replace foo vOld => fork
+			// vNew): read directly from the replacements map, not inferred from
+			// modules.txt — the header is identical whether versioned or not.
+			name: "MarksVersionedWhenReplaceDirectiveNamesAVersion",
+			modules: []modulestxt.Module{{
+				Path:     "example.com/foo",
+				Version:  "v1.2.3",
+				Explicit: true,
+				Replace:  &modulestxt.Replace{Path: "example.com/foo-fork", Version: "v1.2.3"},
+			}},
+			downloads: []ModuleDownload{{Path: "example.com/foo-fork", Version: "v1.2.3", Dir: "/cache/fork"}},
+			replacements: map[string]mod.Replacement{
+				"example.com/foo": {OldPath: "example.com/foo", OldVersion: "v1.2.3", NewPath: "example.com/foo-fork"},
+			},
+			wantHashCalls:    1,
+			wantHash:         "sha256-fresh",
+			wantVersion:      "v1.2.3",
+			wantVersioned:    true,
+			wantReplacedPath: "example.com/foo-fork",
+		},
+		{
+			// Same replacement, but go.mod's directive omits the version (replace
+			// foo => fork vNew) — the common, unversioned form.
+			name: "NotVersionedWhenReplaceDirectiveOmitsVersion",
+			modules: []modulestxt.Module{{
+				Path:     "example.com/foo",
+				Version:  "v1.2.3",
+				Explicit: true,
+				Replace:  &modulestxt.Replace{Path: "example.com/foo-fork", Version: "v1.2.3"},
+			}},
+			downloads: []ModuleDownload{{Path: "example.com/foo-fork", Version: "v1.2.3", Dir: "/cache/fork"}},
+			replacements: map[string]mod.Replacement{
+				"example.com/foo": {OldPath: "example.com/foo", NewPath: "example.com/foo-fork"},
+			},
+			wantHashCalls:    1,
+			wantHash:         "sha256-fresh",
+			wantVersion:      "v1.2.3",
+			wantVersioned:    false,
+			wantReplacedPath: "example.com/foo-fork",
+		},
+		{
+			// An unused wildcard replace: go.mod declares "replace foo => fork
+			// vNew", but nothing requires foo, so go mod vendor recorded only the
+			// trailer form — modules.txt carries no version for foo. Nothing should
+			// be looked up in the download output or hashed; fork's version comes
+			// straight from the replace directive.
+			name: "UnusedWildcardReplaceSkipsDownloadAndHash",
+			modules: []modulestxt.Module{{
+				Path:    "example.com/foo",
+				Replace: &modulestxt.Replace{Path: "example.com/foo-fork", Version: "v9.9.9"},
+			}},
+			wantHashCalls:    0,
+			wantUnused:       true,
+			wantVersion:      "v9.9.9",
+			wantReplacedPath: "example.com/foo-fork",
+		},
+		{
+			// An unused *versioned* replace: go.mod declares "replace foo vOld =>
+			// fork vNew", but nothing requires foo. Unlike the wildcard case, go
+			// mod vendor's trailer-only line still carries foo's old version, so
+			// this is only distinguishable from a used, versioned replace by
+			// having no packages or annotation — not by an empty Version.
+			name: "UnusedVersionedReplaceSkipsDownloadAndHash",
+			modules: []modulestxt.Module{{
+				Path:    "example.com/foo",
+				Version: "v0.8.0",
+				Replace: &modulestxt.Replace{Path: "example.com/foo-fork", Version: "v0.9.1"},
+			}},
+			replacements: map[string]mod.Replacement{
+				"example.com/foo": {OldPath: "example.com/foo", OldVersion: "v0.8.0", NewPath: "example.com/foo-fork"},
+			},
+			wantHashCalls:       0,
+			wantUnused:          true,
+			wantVersioned:       true,
+			wantVersion:         "v0.9.1",
+			wantRequiredVersion: "v0.8.0",
+			wantReplacedPath:    "example.com/foo-fork",
+		},
+		{
+			// An unused wildcard replace whose replacement target *is* found in
+			// the download output — not because foo's replace was exercised, but
+			// because something else independently requires fork too. A naive
+			// "was the replacement path downloaded" check would misclassify this
+			// as used; the entry must still be recognised as unused from its own
+			// shape (no packages, no annotation), regardless of fork's status.
+			name: "UnusedWildcardReplaceIgnoresUnrelatedDownloadOfReplacementTarget",
+			modules: []modulestxt.Module{
+				{
+					Path:    "example.com/foo",
+					Replace: &modulestxt.Replace{Path: "example.com/foo-fork", Version: "v9.9.9"},
+				},
+				{
+					Path:      "example.com/foo-fork",
+					Version:   "v9.9.9",
+					Explicit:  true,
+					GoVersion: "1.22",
+					Packages:  []string{"example.com/foo-fork"},
+				},
+			},
+			downloads:        []ModuleDownload{{Path: "example.com/foo-fork", Version: "v9.9.9", Dir: "/cache/fork"}},
+			wantHashCalls:    1, // only for the second, genuinely-used module entry
+			wantUnused:       true,
+			wantVersion:      "v9.9.9",
+			wantReplacedPath: "example.com/foo-fork",
+			wantVersion2:     "v9.9.9",
+			wantHash2:        "sha256-fresh",
+			wantGoVersion2:   "1.22",
 		},
 		{
 			// modules.txt shows gopkg.in/ini.v1 => example.com/foo-fork.
@@ -425,9 +569,11 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 				Hash: "sha256-replace-cached", GoVersion: "1.22",
 				ReplacedPath: "example.com/foo-fork",
 			}},
-			wantHashCalls: 0,
-			wantHash:      "sha256-replace-cached",
-			wantGoVersion: "1.22",
+			wantHashCalls:    0,
+			wantHash:         "sha256-replace-cached",
+			wantVersion:      "v1.2.3",
+			wantGoVersion:    "1.22",
+			wantReplacedPath: "example.com/foo-fork",
 		},
 		{
 			// Cached entry has no GoVersion (e.g. schema 3 manifest). Hash is still
@@ -437,16 +583,16 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			existingMods: map[string]mod.ModuleConfig{"example.com/foo": {
 				Path: "example.com/foo", Version: "v1.2.3", Hash: "sha256-cached-foo",
 			}},
-			wantHashCalls:      0,
-			wantHash:           "sha256-cached-foo",
-			wantGoVersionEmpty: true,
+			wantHashCalls: 0,
+			wantHash:      "sha256-cached-foo",
+			wantVersion:   "v1.2.3",
 		},
 		{
 			// Cached entry has no GoVersion but modules.txt carries the annotation.
 			// Hash is reused and GoVersion is populated from the modules.txt value.
 			name: "PopulatesGoVersionFromModulesTxtWhenCachedEntryHasNone",
 			modules: []modulestxt.Module{
-				{Path: "example.com/foo", Version: "v1.2.3", Explicit: true, GoVersion: "1.26.0"},
+				{Path: "example.com/foo", Version: "v1.2.3", Explicit: true, GoVersion: "1.26.0", Packages: []string{"example.com/foo"}},
 			},
 			downloads: []ModuleDownload{fooDownload},
 			existingMods: map[string]mod.ModuleConfig{"example.com/foo": {
@@ -454,7 +600,9 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 			}},
 			wantHashCalls: 0,
 			wantHash:      "sha256-cached-foo",
+			wantVersion:   "v1.2.3",
 			wantGoVersion: "1.26.0",
+			wantPackages:  []string{"example.com/foo"},
 		},
 		{
 			// The go.mod replace target changed (fork → fork2) since the manifest was
@@ -472,14 +620,52 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 				Path: "example.com/foo", Version: "v1.2.3",
 				Hash: "sha256-replace-cached", ReplacedPath: "example.com/foo-fork",
 			}},
+			wantHashCalls:    1,
+			wantHash:         "sha256-fresh",
+			wantVersion:      "v1.2.3",
+			wantReplacedPath: "example.com/foo-fork2",
+		},
+		{
+			// A module vendored without an explicit go.mod requirement (purely
+			// transitive) has no "## explicit" annotation in modules.txt.
+			// Every other case in this table sets Explicit: true, so without
+			// this one, Implicit's mapping from !m.Explicit would never
+			// actually be exercised — a regression that always returned
+			// Implicit: false would pass every other case here too.
+			name: "MarksImplicitWhenModuleLacksExplicitAnnotation",
+			modules: []modulestxt.Module{
+				{Path: "example.com/foo", Version: "v1.2.3", Explicit: false},
+			},
+			downloads:     []ModuleDownload{fooDownload},
 			wantHashCalls: 1,
 			wantHash:      "sha256-fresh",
+			wantVersion:   "v1.2.3",
+			wantImplicit:  true,
+		},
+		{
+			// modules.txt lists a module (not an unused replace) with no
+			// matching entry in the download output — the pool goroutine
+			// returns an error, and p.Wait() must propagate it.
+			name: "ReturnsErrorWhenDownloadMissing",
+			modules: []modulestxt.Module{
+				{Path: "example.com/foo", Version: "v1.2.3", Explicit: true},
+			},
+			wantErr: "module example.com/foo not found in download output",
+		},
+		{
+			// Hasher.Hash fails on the cold path (no reusable cached entry) —
+			// the pool goroutine returns a wrapped error, and p.Wait() must
+			// propagate it.
+			name:      "ReturnsErrorWhenHashFails",
+			downloads: []ModuleDownload{fooDownload},
+			hasherErr: errors.New("boom"),
+			wantErr:   "failed to hash downloaded module example.com/foo@v1.2.3: boom",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hasher := &countingHasher{hash: "sha256-fresh"}
+			hasher := &countingHasher{hash: "sha256-fresh", err: tt.hasherErr}
 			r := &Resolver{exec: &fakeExecutor{}, hasher: hasher}
 
 			// Derive plain module entries from downloads when no explicit modules
@@ -496,30 +682,40 @@ func TestResolveRemoteModulesHashReuse(t *testing.T) {
 				}
 			}
 
-			deps, err := r.resolveRemoteModules(context.Background(), modules, tt.downloads, tt.existingMods)
+			deps, err := r.resolveRemoteModules(context.Background(), modules, tt.downloads, tt.existingMods, tt.replacements)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantHashCalls, hasher.count.Load(), "hasher call count")
 
-			if len(deps) > 0 {
-				if tt.wantHash != "" {
-					assert.Equal(t, tt.wantHash, deps[0].Hash, "deps[0].Hash")
-				}
-				if tt.wantGoVersion != "" {
-					assert.Equal(t, tt.wantGoVersion, deps[0].GoVersion, "deps[0].GoVersion")
-				}
-				if tt.wantGoVersionEmpty {
-					assert.Empty(t, deps[0].GoVersion, "deps[0].GoVersion")
-				}
-			}
-			// For multi-module cases, verify the second dep's cached values too.
-			if len(deps) > 1 && tt.existingMods != nil {
-				entry := tt.existingMods[deps[1].Path]
-				if entry.Hash != "" {
-					assert.Equal(t, entry.Hash, deps[1].Hash, "deps[1].Hash")
-				}
-				if entry.GoVersion != "" {
-					assert.Equal(t, entry.GoVersion, deps[1].GoVersion, "deps[1].GoVersion")
-				}
+			// resolveRemoteModules returns exactly one ModuleConfig per input
+			// Module when it doesn't error — require this before indexing deps,
+			// so a regression that silently drops an entry fails loudly here
+			// instead of letting every assertion below skip unnoticed. conker
+			// preserves submission order, so deps[i] corresponds to modules[i].
+			require.Len(t, deps, len(modules))
+
+			assert.Equal(t, tt.wantHash, deps[0].Hash, "deps[0].Hash")
+			assert.Equal(t, tt.wantGoVersion, deps[0].GoVersion, "deps[0].GoVersion")
+			assert.Equal(t, tt.wantVersioned, deps[0].Versioned, "deps[0].Versioned")
+			assert.Equal(t, tt.wantUnused, deps[0].Unused, "deps[0].Unused")
+			assert.Equal(t, tt.wantVersion, deps[0].Version, "deps[0].Version")
+			assert.Equal(t, tt.wantRequiredVersion, deps[0].RequiredVersion, "deps[0].RequiredVersion")
+			assert.Equal(t, tt.wantImplicit, deps[0].Implicit, "deps[0].Implicit")
+			assert.Equal(t, tt.wantReplacedPath, deps[0].ReplacedPath, "deps[0].ReplacedPath")
+			assert.Equal(t, tt.wantPackages, deps[0].Packages, "deps[0].Packages")
+
+			// For multi-module cases, verify the second dep unconditionally too —
+			// gating on tt.existingMods meant a case with no existing manifest
+			// (e.g. HashesAllWhenExistingModsIsNil) never checked its second
+			// entry at all, cached or not.
+			if len(modules) > 1 {
+				assert.Equal(t, tt.wantVersion2, deps[1].Version, "deps[1].Version")
+				assert.Equal(t, tt.wantHash2, deps[1].Hash, "deps[1].Hash")
+				assert.Equal(t, tt.wantGoVersion2, deps[1].GoVersion, "deps[1].GoVersion")
 			}
 		})
 	}
